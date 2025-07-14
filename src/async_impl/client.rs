@@ -49,6 +49,7 @@ use http::header::{
 };
 use http::uri::Scheme;
 use http::Uri;
+use hyper::rt::{Executor, Timer};
 use hyper_util::client::legacy::connect::HttpConnector;
 #[cfg(feature = "default-tls")]
 use native_tls_crate::TlsConnector;
@@ -84,9 +85,10 @@ pub struct Client {
 
 /// A `ClientBuilder` can be used to create a `Client` with custom configuration.
 #[must_use]
-pub struct ClientBuilder<E = hyper_util::rt::TokioExecutor> {
+pub struct ClientBuilder<E = hyper_util::rt::TokioExecutor, M = hyper_util::rt::TokioTimer> {
     config: Config,
     executor: E,
+    timer: M,
 }
 
 enum HttpVersionPref {
@@ -385,13 +387,15 @@ impl ClientBuilder {
                 dns_resolver: None,
             },
             executor: hyper_util::rt::TokioExecutor::new(),
+            timer: hyper_util::rt::TokioTimer::new(),
         }
     }
 }
 
-impl<E> ClientBuilder<E>
+impl<E, M> ClientBuilder<E, M>
 where
-    E: hyper::rt::Executor<BoxSendFuture> + Send + Sync + Clone + 'static,
+    E: Executor<BoxSendFuture> + Send + Sync + Clone + 'static,
+    M: Timer + Clone + Send + Sync + 'static,
 {
     /// Returns a `Client` that uses this `ClientBuilder` configuration.
     ///
@@ -918,6 +922,7 @@ where
 
         let mut builder =
             hyper_util::client::legacy::Client::builder(self.executor);
+
         #[cfg(feature = "http2")]
         {
             if matches!(config.http_version_pref, HttpVersionPref::Http2) {
@@ -953,10 +958,11 @@ where
             }
         }
 
-        builder.timer(hyper_util::rt::TokioTimer::new());
-        builder.pool_timer(hyper_util::rt::TokioTimer::new());
+        builder.pool_timer(self.timer.clone());
         builder.pool_idle_timeout(config.pool_idle_timeout);
         builder.pool_max_idle_per_host(config.pool_max_idle_per_host);
+
+        builder.timer(self.timer);
 
         if config.http09_responses {
             builder.http09_responses(true);
@@ -1062,7 +1068,7 @@ where
     /// # Ok(())
     /// # }
     /// ```
-    pub fn user_agent<V>(mut self, value: V) -> ClientBuilder<E>
+    pub fn user_agent<V>(mut self, value: V) -> ClientBuilder<E, M>
     where
         V: TryInto<HeaderValue>,
         V::Error: Into<http::Error>,
@@ -1100,7 +1106,7 @@ where
     /// # Ok(())
     /// # }
     /// ```
-    pub fn default_headers(mut self, headers: HeaderMap) -> ClientBuilder<E> {
+    pub fn default_headers(mut self, headers: HeaderMap) -> ClientBuilder<E, M> {
         for (key, value) in headers.iter() {
             self.config.headers.insert(key, value.clone());
         }
@@ -1123,7 +1129,7 @@ where
     /// This requires the optional `cookies` feature to be enabled.
     #[cfg(feature = "cookies")]
     #[cfg_attr(docsrs, doc(cfg(feature = "cookies")))]
-    pub fn cookie_store(mut self, enable: bool) -> ClientBuilder<E> {
+    pub fn cookie_store(mut self, enable: bool) -> ClientBuilder<E, M> {
         if enable {
             self.cookie_provider(Arc::new(cookie::Jar::default()))
         } else {
@@ -1150,7 +1156,7 @@ where
     pub fn cookie_provider<C: cookie::CookieStore + 'static>(
         mut self,
         cookie_store: Arc<C>,
-    ) -> ClientBuilder<E> {
+    ) -> ClientBuilder<E, M> {
         self.config.cookie_store = Some(cookie_store as _);
         self
     }
@@ -1173,7 +1179,7 @@ where
     /// This requires the optional `gzip` feature to be enabled
     #[cfg(feature = "gzip")]
     #[cfg_attr(docsrs, doc(cfg(feature = "gzip")))]
-    pub fn gzip(mut self, enable: bool) -> ClientBuilder<E> {
+    pub fn gzip(mut self, enable: bool) -> ClientBuilder<E, M> {
         self.config.accepts.gzip = enable;
         self
     }
@@ -1196,7 +1202,7 @@ where
     /// This requires the optional `brotli` feature to be enabled
     #[cfg(feature = "brotli")]
     #[cfg_attr(docsrs, doc(cfg(feature = "brotli")))]
-    pub fn brotli(mut self, enable: bool) -> ClientBuilder<E> {
+    pub fn brotli(mut self, enable: bool) -> ClientBuilder<E, M> {
         self.config.accepts.brotli = enable;
         self
     }
@@ -1219,7 +1225,7 @@ where
     /// This requires the optional `zstd` feature to be enabled
     #[cfg(feature = "zstd")]
     #[cfg_attr(docsrs, doc(cfg(feature = "zstd")))]
-    pub fn zstd(mut self, enable: bool) -> ClientBuilder<E> {
+    pub fn zstd(mut self, enable: bool) -> ClientBuilder<E, M> {
         self.config.accepts.zstd = enable;
         self
     }
@@ -1242,7 +1248,7 @@ where
     /// This requires the optional `deflate` feature to be enabled
     #[cfg(feature = "deflate")]
     #[cfg_attr(docsrs, doc(cfg(feature = "deflate")))]
-    pub fn deflate(mut self, enable: bool) -> ClientBuilder<E> {
+    pub fn deflate(mut self, enable: bool) -> ClientBuilder<E, M> {
         self.config.accepts.deflate = enable;
         self
     }
@@ -1252,7 +1258,7 @@ where
     /// This method exists even if the optional `gzip` feature is not enabled.
     /// This can be used to ensure a `Client` doesn't use gzip decompression
     /// even if another dependency were to enable the optional `gzip` feature.
-    pub fn no_gzip(self) -> ClientBuilder<E> {
+    pub fn no_gzip(self) -> ClientBuilder<E, M> {
         #[cfg(feature = "gzip")]
         {
             self.gzip(false)
@@ -1269,7 +1275,7 @@ where
     /// This method exists even if the optional `brotli` feature is not enabled.
     /// This can be used to ensure a `Client` doesn't use brotli decompression
     /// even if another dependency were to enable the optional `brotli` feature.
-    pub fn no_brotli(self) -> ClientBuilder<E> {
+    pub fn no_brotli(self) -> ClientBuilder<E, M> {
         #[cfg(feature = "brotli")]
         {
             self.brotli(false)
@@ -1286,7 +1292,7 @@ where
     /// This method exists even if the optional `zstd` feature is not enabled.
     /// This can be used to ensure a `Client` doesn't use zstd decompression
     /// even if another dependency were to enable the optional `zstd` feature.
-    pub fn no_zstd(self) -> ClientBuilder<E> {
+    pub fn no_zstd(self) -> ClientBuilder<E, M> {
         #[cfg(feature = "zstd")]
         {
             self.zstd(false)
@@ -1303,7 +1309,7 @@ where
     /// This method exists even if the optional `deflate` feature is not enabled.
     /// This can be used to ensure a `Client` doesn't use deflate decompression
     /// even if another dependency were to enable the optional `deflate` feature.
-    pub fn no_deflate(self) -> ClientBuilder<E> {
+    pub fn no_deflate(self) -> ClientBuilder<E, M> {
         #[cfg(feature = "deflate")]
         {
             self.deflate(false)
@@ -1320,7 +1326,7 @@ where
     /// Set a `RedirectPolicy` for this client.
     ///
     /// Default will follow redirects up to a maximum of 10.
-    pub fn redirect(mut self, policy: redirect::Policy) -> ClientBuilder<E> {
+    pub fn redirect(mut self, policy: redirect::Policy) -> ClientBuilder<E, M> {
         self.config.redirect_policy = policy;
         self
     }
@@ -1328,7 +1334,7 @@ where
     /// Enable or disable automatic setting of the `Referer` header.
     ///
     /// Default is `true`.
-    pub fn referer(mut self, enable: bool) -> ClientBuilder<E> {
+    pub fn referer(mut self, enable: bool) -> ClientBuilder<E, M> {
         self.config.referer = enable;
         self
     }
@@ -1340,7 +1346,7 @@ where
     /// # Note
     ///
     /// Adding a proxy will disable the automatic usage of the "system" proxy.
-    pub fn proxy(mut self, proxy: Proxy) -> ClientBuilder<E> {
+    pub fn proxy(mut self, proxy: Proxy) -> ClientBuilder<E, M> {
         self.config.proxies.push(proxy.into_matcher());
         self.config.auto_sys_proxy = false;
         self
@@ -1353,7 +1359,7 @@ where
     /// on all desired proxies instead.
     ///
     /// This also disables the automatic usage of the "system" proxy.
-    pub fn no_proxy(mut self) -> ClientBuilder<E> {
+    pub fn no_proxy(mut self) -> ClientBuilder<E, M> {
         self.config.proxies.clear();
         self.config.auto_sys_proxy = false;
         self
@@ -1367,7 +1373,7 @@ where
     /// response body has finished. Also considered a total deadline.
     ///
     /// Default is no timeout.
-    pub fn timeout(mut self, timeout: Duration) -> ClientBuilder<E> {
+    pub fn timeout(mut self, timeout: Duration) -> ClientBuilder<E, M> {
         self.config.timeout = Some(timeout);
         self
     }
@@ -1379,7 +1385,7 @@ where
     /// connections when the size isn't known beforehand.
     ///
     /// Default is no timeout.
-    pub fn read_timeout(mut self, timeout: Duration) -> ClientBuilder<E> {
+    pub fn read_timeout(mut self, timeout: Duration) -> ClientBuilder<E, M> {
         self.config.read_timeout = Some(timeout);
         self
     }
@@ -1392,7 +1398,7 @@ where
     ///
     /// This **requires** the futures be executed in a tokio runtime with
     /// a tokio timer enabled.
-    pub fn connect_timeout(mut self, timeout: Duration) -> ClientBuilder<E> {
+    pub fn connect_timeout(mut self, timeout: Duration) -> ClientBuilder<E, M> {
         self.config.connect_timeout = Some(timeout);
         self
     }
@@ -1403,7 +1409,7 @@ where
     /// for read and write operations on connections.
     ///
     /// [log]: https://crates.io/crates/log
-    pub fn connection_verbose(mut self, verbose: bool) -> ClientBuilder<E> {
+    pub fn connection_verbose(mut self, verbose: bool) -> ClientBuilder<E, M> {
         self.config.connection_verbose = verbose;
         self
     }
@@ -1415,7 +1421,7 @@ where
     /// Pass `None` to disable timeout.
     ///
     /// Default is 90 seconds.
-    pub fn pool_idle_timeout<D>(mut self, val: D) -> ClientBuilder<E>
+    pub fn pool_idle_timeout<D>(mut self, val: D) -> ClientBuilder<E, M>
     where
         D: Into<Option<Duration>>,
     {
@@ -1424,13 +1430,13 @@ where
     }
 
     /// Sets the maximum idle connection per host allowed in the pool.
-    pub fn pool_max_idle_per_host(mut self, max: usize) -> ClientBuilder<E> {
+    pub fn pool_max_idle_per_host(mut self, max: usize) -> ClientBuilder<E, M> {
         self.config.pool_max_idle_per_host = max;
         self
     }
 
     /// Send headers as title case instead of lowercase.
-    pub fn http1_title_case_headers(mut self) -> ClientBuilder<E> {
+    pub fn http1_title_case_headers(mut self) -> ClientBuilder<E, M> {
         self.config.http1_title_case_headers = true;
         self
     }
@@ -1443,14 +1449,14 @@ where
     pub fn http1_allow_obsolete_multiline_headers_in_responses(
         mut self,
         value: bool,
-    ) -> ClientBuilder<E> {
+    ) -> ClientBuilder<E, M> {
         self.config
             .http1_allow_obsolete_multiline_headers_in_responses = value;
         self
     }
 
     /// Sets whether invalid header lines should be silently ignored in HTTP/1 responses.
-    pub fn http1_ignore_invalid_headers_in_responses(mut self, value: bool) -> ClientBuilder<E> {
+    pub fn http1_ignore_invalid_headers_in_responses(mut self, value: bool) -> ClientBuilder<E, M> {
         self.config.http1_ignore_invalid_headers_in_responses = value;
         self
     }
@@ -1463,20 +1469,20 @@ where
     pub fn http1_allow_spaces_after_header_name_in_responses(
         mut self,
         value: bool,
-    ) -> ClientBuilder<E> {
+    ) -> ClientBuilder<E, M> {
         self.config
             .http1_allow_spaces_after_header_name_in_responses = value;
         self
     }
 
     /// Only use HTTP/1.
-    pub fn http1_only(mut self) -> ClientBuilder<E> {
+    pub fn http1_only(mut self) -> ClientBuilder<E, M> {
         self.config.http_version_pref = HttpVersionPref::Http1;
         self
     }
 
     /// Allow HTTP/0.9 responses
-    pub fn http09_responses(mut self) -> ClientBuilder<E> {
+    pub fn http09_responses(mut self) -> ClientBuilder<E, M> {
         self.config.http09_responses = true;
         self
     }
@@ -1484,7 +1490,7 @@ where
     /// Only use HTTP/2.
     #[cfg(feature = "http2")]
     #[cfg_attr(docsrs, doc(cfg(feature = "http2")))]
-    pub fn http2_prior_knowledge(mut self) -> ClientBuilder<E> {
+    pub fn http2_prior_knowledge(mut self) -> ClientBuilder<E, M> {
         self.config.http_version_pref = HttpVersionPref::Http2;
         self
     }
@@ -1492,7 +1498,7 @@ where
     /// Only use HTTP/3.
     #[cfg(feature = "http3")]
     #[cfg_attr(docsrs, doc(cfg(all(reqwest_unstable, feature = "http3",))))]
-    pub fn http3_prior_knowledge(mut self) -> ClientBuilder<E> {
+    pub fn http3_prior_knowledge(mut self) -> ClientBuilder<E, M> {
         self.config.http_version_pref = HttpVersionPref::Http3;
         self
     }
@@ -1502,7 +1508,7 @@ where
     /// Default is currently 65,535 but may change internally to optimize for common uses.
     #[cfg(feature = "http2")]
     #[cfg_attr(docsrs, doc(cfg(feature = "http2")))]
-    pub fn http2_initial_stream_window_size(mut self, sz: impl Into<Option<u32>>) -> ClientBuilder<E> {
+    pub fn http2_initial_stream_window_size(mut self, sz: impl Into<Option<u32>>) -> ClientBuilder<E, M> {
         self.config.http2_initial_stream_window_size = sz.into();
         self
     }
@@ -1515,7 +1521,7 @@ where
     pub fn http2_initial_connection_window_size(
         mut self,
         sz: impl Into<Option<u32>>,
-    ) -> ClientBuilder<E> {
+    ) -> ClientBuilder<E, M> {
         self.config.http2_initial_connection_window_size = sz.into();
         self
     }
@@ -1526,7 +1532,7 @@ where
     /// `http2_initial_connection_window_size`.
     #[cfg(feature = "http2")]
     #[cfg_attr(docsrs, doc(cfg(feature = "http2")))]
-    pub fn http2_adaptive_window(mut self, enabled: bool) -> ClientBuilder<E> {
+    pub fn http2_adaptive_window(mut self, enabled: bool) -> ClientBuilder<E, M> {
         self.config.http2_adaptive_window = enabled;
         self
     }
@@ -1536,7 +1542,7 @@ where
     /// Default is currently 16,384 but may change internally to optimize for common uses.
     #[cfg(feature = "http2")]
     #[cfg_attr(docsrs, doc(cfg(feature = "http2")))]
-    pub fn http2_max_frame_size(mut self, sz: impl Into<Option<u32>>) -> ClientBuilder<E> {
+    pub fn http2_max_frame_size(mut self, sz: impl Into<Option<u32>>) -> ClientBuilder<E, M> {
         self.config.http2_max_frame_size = sz.into();
         self
     }
@@ -1546,7 +1552,7 @@ where
     /// Default is currently 16KB, but can change.
     #[cfg(feature = "http2")]
     #[cfg_attr(docsrs, doc(cfg(feature = "http2")))]
-    pub fn http2_max_header_list_size(mut self, max_header_size_bytes: u32) -> ClientBuilder<E> {
+    pub fn http2_max_header_list_size(mut self, max_header_size_bytes: u32) -> ClientBuilder<E, M> {
         self.config.http2_max_header_list_size = Some(max_header_size_bytes);
         self
     }
@@ -1560,7 +1566,7 @@ where
     pub fn http2_keep_alive_interval(
         mut self,
         interval: impl Into<Option<Duration>>,
-    ) -> ClientBuilder<E> {
+    ) -> ClientBuilder<E, M> {
         self.config.http2_keep_alive_interval = interval.into();
         self
     }
@@ -1572,7 +1578,7 @@ where
     /// Default is currently disabled.
     #[cfg(feature = "http2")]
     #[cfg_attr(docsrs, doc(cfg(feature = "http2")))]
-    pub fn http2_keep_alive_timeout(mut self, timeout: Duration) -> ClientBuilder<E> {
+    pub fn http2_keep_alive_timeout(mut self, timeout: Duration) -> ClientBuilder<E, M> {
         self.config.http2_keep_alive_timeout = Some(timeout);
         self
     }
@@ -1585,7 +1591,7 @@ where
     /// Default is `false`.
     #[cfg(feature = "http2")]
     #[cfg_attr(docsrs, doc(cfg(feature = "http2")))]
-    pub fn http2_keep_alive_while_idle(mut self, enabled: bool) -> ClientBuilder<E> {
+    pub fn http2_keep_alive_while_idle(mut self, enabled: bool) -> ClientBuilder<E, M> {
         self.config.http2_keep_alive_while_idle = enabled;
         self
     }
@@ -1595,7 +1601,7 @@ where
     /// Set whether sockets have `TCP_NODELAY` enabled.
     ///
     /// Default is `true`.
-    pub fn tcp_nodelay(mut self, enabled: bool) -> ClientBuilder<E> {
+    pub fn tcp_nodelay(mut self, enabled: bool) -> ClientBuilder<E, M> {
         self.config.nodelay = enabled;
         self
     }
@@ -1614,7 +1620,7 @@ where
     /// # Ok(())
     /// # }
     /// ```
-    pub fn local_address<T>(mut self, addr: T) -> ClientBuilder<E>
+    pub fn local_address<T>(mut self, addr: T) -> ClientBuilder<E, M>
     where
         T: Into<Option<IpAddr>>,
     {
@@ -1666,7 +1672,7 @@ where
         target_os = "visionos",
         target_os = "watchos",
     ))]
-    pub fn interface(mut self, interface: &str) -> ClientBuilder<E> {
+    pub fn interface(mut self, interface: &str) -> ClientBuilder<E, M> {
         self.config.interface = Some(interface.to_string());
         self
     }
@@ -1674,7 +1680,7 @@ where
     /// Set that all sockets have `SO_KEEPALIVE` set with the supplied duration.
     ///
     /// If `None`, the option will not be set.
-    pub fn tcp_keepalive<D>(mut self, val: D) -> ClientBuilder<E>
+    pub fn tcp_keepalive<D>(mut self, val: D) -> ClientBuilder<E, M>
     where
         D: Into<Option<Duration>>,
     {
@@ -1685,7 +1691,7 @@ where
     /// Set that all sockets have `SO_KEEPALIVE` set with the supplied interval.
     ///
     /// If `None`, the option will not be set.
-    pub fn tcp_keepalive_interval<D>(mut self, val: D) -> ClientBuilder<E>
+    pub fn tcp_keepalive_interval<D>(mut self, val: D) -> ClientBuilder<E, M>
     where
         D: Into<Option<Duration>>,
     {
@@ -1696,7 +1702,7 @@ where
     /// Set that all sockets have `SO_KEEPALIVE` set with the supplied retry count.
     ///
     /// If `None`, the option will not be set.
-    pub fn tcp_keepalive_retries<C>(mut self, retries: C) -> ClientBuilder<E>
+    pub fn tcp_keepalive_retries<C>(mut self, retries: C) -> ClientBuilder<E, M>
     where
         C: Into<Option<u32>>,
     {
@@ -1711,7 +1717,7 @@ where
     ///
     /// The current default is `None` (option disabled).
     #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
-    pub fn tcp_user_timeout<D>(mut self, val: D) -> ClientBuilder<E>
+    pub fn tcp_user_timeout<D>(mut self, val: D) -> ClientBuilder<E, M>
     where
         D: Into<Option<Duration>>,
     {
@@ -1739,7 +1745,7 @@ where
             feature = "rustls-tls"
         )))
     )]
-    pub fn add_root_certificate(mut self, cert: Certificate) -> ClientBuilder<E> {
+    pub fn add_root_certificate(mut self, cert: Certificate) -> ClientBuilder<E, M> {
         self.config.root_certs.push(cert);
         self
     }
@@ -1752,7 +1758,7 @@ where
     /// This requires the `rustls-tls(-...)` Cargo feature enabled.
     #[cfg(feature = "__rustls")]
     #[cfg_attr(docsrs, doc(cfg(feature = "rustls-tls")))]
-    pub fn add_crl(mut self, crl: CertificateRevocationList) -> ClientBuilder<E> {
+    pub fn add_crl(mut self, crl: CertificateRevocationList) -> ClientBuilder<E, M> {
         self.config.crls.push(crl);
         self
     }
@@ -1768,7 +1774,7 @@ where
     pub fn add_crls(
         mut self,
         crls: impl IntoIterator<Item = CertificateRevocationList>,
-    ) -> ClientBuilder<E> {
+    ) -> ClientBuilder<E, M> {
         self.config.crls.extend(crls);
         self
     }
@@ -1799,7 +1805,7 @@ where
             feature = "rustls-tls"
         )))
     )]
-    pub fn tls_built_in_root_certs(mut self, tls_built_in_root_certs: bool) -> ClientBuilder<E> {
+    pub fn tls_built_in_root_certs(mut self, tls_built_in_root_certs: bool) -> ClientBuilder<E, M> {
         self.config.tls_built_in_root_certs = tls_built_in_root_certs;
 
         #[cfg(feature = "rustls-tls-webpki-roots-no-provider")]
@@ -1820,7 +1826,7 @@ where
     /// If the feature is enabled, this value is `true` by default.
     #[cfg(feature = "rustls-tls-webpki-roots-no-provider")]
     #[cfg_attr(docsrs, doc(cfg(feature = "rustls-tls-webpki-roots-no-provider")))]
-    pub fn tls_built_in_webpki_certs(mut self, enabled: bool) -> ClientBuilder<E> {
+    pub fn tls_built_in_webpki_certs(mut self, enabled: bool) -> ClientBuilder<E, M> {
         self.config.tls_built_in_certs_webpki = enabled;
         self
     }
@@ -1830,7 +1836,7 @@ where
     /// If the feature is enabled, this value is `true` by default.
     #[cfg(feature = "rustls-tls-native-roots-no-provider")]
     #[cfg_attr(docsrs, doc(cfg(feature = "rustls-tls-native-roots-no-provider")))]
-    pub fn tls_built_in_native_certs(mut self, enabled: bool) -> ClientBuilder<E> {
+    pub fn tls_built_in_native_certs(mut self, enabled: bool) -> ClientBuilder<E, M> {
         self.config.tls_built_in_certs_native = enabled;
         self
     }
@@ -1843,7 +1849,7 @@ where
     /// enabled.
     #[cfg(any(feature = "native-tls", feature = "__rustls"))]
     #[cfg_attr(docsrs, doc(cfg(any(feature = "native-tls", feature = "rustls-tls"))))]
-    pub fn identity(mut self, identity: Identity) -> ClientBuilder<E> {
+    pub fn identity(mut self, identity: Identity) -> ClientBuilder<E, M> {
         self.config.identity = Some(identity);
         self
     }
@@ -1875,7 +1881,7 @@ where
     pub fn danger_accept_invalid_hostnames(
         mut self,
         accept_invalid_hostname: bool,
-    ) -> ClientBuilder<E> {
+    ) -> ClientBuilder<E, M> {
         self.config.hostname_verification = !accept_invalid_hostname;
         self
     }
@@ -1905,7 +1911,7 @@ where
             feature = "rustls-tls"
         )))
     )]
-    pub fn danger_accept_invalid_certs(mut self, accept_invalid_certs: bool) -> ClientBuilder<E> {
+    pub fn danger_accept_invalid_certs(mut self, accept_invalid_certs: bool) -> ClientBuilder<E, M> {
         self.config.certs_verification = !accept_invalid_certs;
         self
     }
@@ -1927,7 +1933,7 @@ where
             feature = "rustls-tls"
         )))
     )]
-    pub fn tls_sni(mut self, tls_sni: bool) -> ClientBuilder<E> {
+    pub fn tls_sni(mut self, tls_sni: bool) -> ClientBuilder<E, M> {
         self.config.tls_sni = tls_sni;
         self
     }
@@ -1956,7 +1962,7 @@ where
             feature = "rustls-tls"
         )))
     )]
-    pub fn min_tls_version(mut self, version: tls::Version) -> ClientBuilder<E> {
+    pub fn min_tls_version(mut self, version: tls::Version) -> ClientBuilder<E, M> {
         self.config.min_tls_version = Some(version);
         self
     }
@@ -1988,7 +1994,7 @@ where
             feature = "rustls-tls"
         )))
     )]
-    pub fn max_tls_version(mut self, version: tls::Version) -> ClientBuilder<E> {
+    pub fn max_tls_version(mut self, version: tls::Version) -> ClientBuilder<E, M> {
         self.config.max_tls_version = Some(version);
         self
     }
@@ -2003,7 +2009,7 @@ where
     /// This requires the optional `native-tls` feature to be enabled.
     #[cfg(feature = "native-tls")]
     #[cfg_attr(docsrs, doc(cfg(feature = "native-tls")))]
-    pub fn use_native_tls(mut self) -> ClientBuilder<E> {
+    pub fn use_native_tls(mut self) -> ClientBuilder<E, M> {
         self.config.tls = TlsBackend::Default;
         self
     }
@@ -2018,7 +2024,7 @@ where
     /// This requires the optional `rustls-tls(-...)` feature to be enabled.
     #[cfg(feature = "__rustls")]
     #[cfg_attr(docsrs, doc(cfg(feature = "rustls-tls")))]
-    pub fn use_rustls_tls(mut self) -> ClientBuilder<E> {
+    pub fn use_rustls_tls(mut self) -> ClientBuilder<E, M> {
         self.config.tls = TlsBackend::Rustls;
         self
     }
@@ -2043,7 +2049,7 @@ where
     /// `rustls-tls(-...)` to be enabled.
     #[cfg(any(feature = "native-tls", feature = "__rustls",))]
     #[cfg_attr(docsrs, doc(cfg(any(feature = "native-tls", feature = "rustls-tls"))))]
-    pub fn use_preconfigured_tls(mut self, tls: impl Any) -> ClientBuilder<E> {
+    pub fn use_preconfigured_tls(mut self, tls: impl Any) -> ClientBuilder<E, M> {
         let mut tls = Some(tls);
         #[cfg(feature = "native-tls")]
         {
@@ -2086,7 +2092,7 @@ where
             feature = "rustls-tls"
         )))
     )]
-    pub fn tls_info(mut self, tls_info: bool) -> ClientBuilder<E> {
+    pub fn tls_info(mut self, tls_info: bool) -> ClientBuilder<E, M> {
         self.config.tls_info = tls_info;
         self
     }
@@ -2094,7 +2100,7 @@ where
     /// Restrict the Client to be used with HTTPS only requests.
     ///
     /// Defaults to false.
-    pub fn https_only(mut self, enabled: bool) -> ClientBuilder<E> {
+    pub fn https_only(mut self, enabled: bool) -> ClientBuilder<E, M> {
         self.config.https_only = enabled;
         self
     }
@@ -2103,7 +2109,7 @@ where
     #[cfg(feature = "hickory-dns")]
     #[cfg_attr(docsrs, doc(cfg(feature = "hickory-dns")))]
     #[deprecated(note = "use `hickory_dns` instead")]
-    pub fn trust_dns(mut self, enable: bool) -> ClientBuilder<E> {
+    pub fn trust_dns(mut self, enable: bool) -> ClientBuilder<E, M> {
         self.config.hickory_dns = enable;
         self
     }
@@ -2123,14 +2129,14 @@ where
     /// that the default resolver does
     #[cfg(feature = "hickory-dns")]
     #[cfg_attr(docsrs, doc(cfg(feature = "hickory-dns")))]
-    pub fn hickory_dns(mut self, enable: bool) -> ClientBuilder<E> {
+    pub fn hickory_dns(mut self, enable: bool) -> ClientBuilder<E, M> {
         self.config.hickory_dns = enable;
         self
     }
 
     #[doc(hidden)]
     #[deprecated(note = "use `no_hickory_dns` instead")]
-    pub fn no_trust_dns(self) -> ClientBuilder<E> {
+    pub fn no_trust_dns(self) -> ClientBuilder<E, M> {
         self.no_hickory_dns()
     }
 
@@ -2139,7 +2145,7 @@ where
     /// This method exists even if the optional `hickory-dns` feature is not enabled.
     /// This can be used to ensure a `Client` doesn't use the hickory-dns async resolver
     /// even if another dependency were to enable the optional `hickory-dns` feature.
-    pub fn no_hickory_dns(self) -> ClientBuilder<E> {
+    pub fn no_hickory_dns(self) -> ClientBuilder<E, M> {
         #[cfg(feature = "hickory-dns")]
         {
             self.hickory_dns(false)
@@ -2155,7 +2161,7 @@ where
     ///
     /// Set the port to `0` to use the conventional port for the given scheme (e.g. 80 for http).
     /// Ports in the URL itself will always be used instead of the port in the overridden addr.
-    pub fn resolve(self, domain: &str, addr: SocketAddr) -> ClientBuilder<E> {
+    pub fn resolve(self, domain: &str, addr: SocketAddr) -> ClientBuilder<E, M> {
         self.resolve_to_addrs(domain, &[addr])
     }
 
@@ -2163,7 +2169,7 @@ where
     ///
     /// Set the port to `0` to use the conventional port for the given scheme (e.g. 80 for http).
     /// Ports in the URL itself will always be used instead of the port in the overridden addr.
-    pub fn resolve_to_addrs(mut self, domain: &str, addrs: &[SocketAddr]) -> ClientBuilder<E> {
+    pub fn resolve_to_addrs(mut self, domain: &str, addrs: &[SocketAddr]) -> ClientBuilder<E, M> {
         self.config
             .dns_overrides
             .insert(domain.to_ascii_lowercase(), addrs.to_vec());
@@ -2175,7 +2181,7 @@ where
     /// Pass an `Arc` wrapping a trait object implementing `Resolve`.
     /// Overrides for specific names passed to `resolve` and `resolve_to_addrs` will
     /// still be applied on top of this resolver.
-    pub fn dns_resolver<R: Resolve + 'static>(mut self, resolver: Arc<R>) -> ClientBuilder<E> {
+    pub fn dns_resolver<R: Resolve + 'static>(mut self, resolver: Arc<R>) -> ClientBuilder<E, M> {
         self.config.dns_resolver = Some(resolver as _);
         self
     }
@@ -2186,7 +2192,7 @@ where
     /// The default is false.
     #[cfg(feature = "http3")]
     #[cfg_attr(docsrs, doc(cfg(all(reqwest_unstable, feature = "http3",))))]
-    pub fn tls_early_data(mut self, enabled: bool) -> ClientBuilder<E> {
+    pub fn tls_early_data(mut self, enabled: bool) -> ClientBuilder<E, M> {
         self.config.tls_enable_early_data = enabled;
         self
     }
@@ -2198,7 +2204,7 @@ where
     /// [`TransportConfig`]: https://docs.rs/quinn/latest/quinn/struct.TransportConfig.html
     #[cfg(feature = "http3")]
     #[cfg_attr(docsrs, doc(cfg(all(reqwest_unstable, feature = "http3",))))]
-    pub fn http3_max_idle_timeout(mut self, value: Duration) -> ClientBuilder<E> {
+    pub fn http3_max_idle_timeout(mut self, value: Duration) -> ClientBuilder<E, M> {
         self.config.quic_max_idle_timeout = Some(value);
         self
     }
@@ -2215,7 +2221,7 @@ where
     /// Panics if the value is over 2^62.
     #[cfg(feature = "http3")]
     #[cfg_attr(docsrs, doc(cfg(all(reqwest_unstable, feature = "http3",))))]
-    pub fn http3_stream_receive_window(mut self, value: u64) -> ClientBuilder<E> {
+    pub fn http3_stream_receive_window(mut self, value: u64) -> ClientBuilder<E, M> {
         self.config.quic_stream_receive_window = Some(value.try_into().unwrap());
         self
     }
@@ -2232,7 +2238,7 @@ where
     /// Panics if the value is over 2^62.
     #[cfg(feature = "http3")]
     #[cfg_attr(docsrs, doc(cfg(all(reqwest_unstable, feature = "http3",))))]
-    pub fn http3_conn_receive_window(mut self, value: u64) -> ClientBuilder<E> {
+    pub fn http3_conn_receive_window(mut self, value: u64) -> ClientBuilder<E, M> {
         self.config.quic_receive_window = Some(value.try_into().unwrap());
         self
     }
@@ -2244,7 +2250,7 @@ where
     /// [`TransportConfig`]: https://docs.rs/quinn/latest/quinn/struct.TransportConfig.html
     #[cfg(feature = "http3")]
     #[cfg_attr(docsrs, doc(cfg(all(reqwest_unstable, feature = "http3",))))]
-    pub fn http3_send_window(mut self, value: u64) -> ClientBuilder<E> {
+    pub fn http3_send_window(mut self, value: u64) -> ClientBuilder<E, M> {
         self.config.quic_send_window = Some(value);
         self
     }
@@ -2258,7 +2264,7 @@ where
     /// [CUBIC]: https://datatracker.ietf.org/doc/html/rfc8312
     #[cfg(feature = "http3")]
     #[cfg_attr(docsrs, doc(cfg(all(reqwest_unstable, feature = "http3",))))]
-    pub fn http3_congestion_bbr(mut self) -> ClientBuilder<E> {
+    pub fn http3_congestion_bbr(mut self) -> ClientBuilder<E, M> {
         self.config.quic_congestion_bbr = true;
         self
     }
@@ -2274,7 +2280,7 @@ where
     /// [`Builder`]: https://docs.rs/h3/latest/h3/client/struct.Builder.html#method.max_field_section_size
     #[cfg(feature = "http3")]
     #[cfg_attr(docsrs, doc(cfg(all(reqwest_unstable, feature = "http3",))))]
-    pub fn http3_max_field_section_size(mut self, value: u64) -> ClientBuilder<E> {
+    pub fn http3_max_field_section_size(mut self, value: u64) -> ClientBuilder<E, M> {
         self.config.h3_max_field_section_size = Some(value.try_into().unwrap());
         self
     }
@@ -2292,7 +2298,7 @@ where
     /// [`Builder`]: https://docs.rs/h3/latest/h3/client/struct.Builder.html#method.send_grease
     #[cfg(feature = "http3")]
     #[cfg_attr(docsrs, doc(cfg(all(reqwest_unstable, feature = "http3",))))]
-    pub fn http3_send_grease(mut self, enabled: bool) -> ClientBuilder<E> {
+    pub fn http3_send_grease(mut self, enabled: bool) -> ClientBuilder<E, M> {
         self.config.h3_send_grease = Some(enabled);
         self
     }
@@ -2320,7 +2326,7 @@ where
     ///                      .unwrap();
     /// ```
     ///
-    pub fn connector_layer<L>(mut self, layer: L) -> ClientBuilder<E>
+    pub fn connector_layer<L>(mut self, layer: L) -> ClientBuilder<E, M>
     where
         L: Layer<BoxedConnectorService> + Clone + Send + Sync + 'static,
         L::Service:
@@ -2337,11 +2343,21 @@ where
     /// Set a custom executor for the HTTP client.
     ///
     /// By default, the client uses `hyper_util::rt::TokioExecutor`.
-    pub fn executor<F>(self, executor: F) -> ClientBuilder<F>
+    pub fn executor<F>(self, executor: F) -> ClientBuilder<F, M>
     where
         F: hyper::rt::Executor<BoxSendFuture> + Send + Sync + Clone + 'static,
     {
-        ClientBuilder { config: self.config, executor }
+        ClientBuilder { executor, config: self.config, timer: self.timer }
+    }
+
+    /// Set a custom timer for the HTTP client.
+    ///
+    /// By default, the client uses `hyper_util::rt::TokioTimer`.
+    pub fn timer<N>(self, timer: N) -> ClientBuilder<E, N>
+    where
+        N: Timer + Clone + Send + Sync + 'static,
+    {
+        ClientBuilder { timer, config: self.config, executor: self.executor }
     }
 }
 
